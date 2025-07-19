@@ -4,6 +4,12 @@
 
 在服务器重启后，生产者持续报告 `NotLeaderOrFollowerException` 异常。经调查发现，根本原因是leader发生变化但leaderEpoch没有更新，导致了"僵尸leader"现象。
 
+## 重要说明
+
+**此修复仅适用于使用ZooKeeper的Kafka环境！**
+
+在KRaft模式下，此修复将自动禁用，因为KRaft使用不同的控制器实现和选举机制。KRaft已经通过其Raft共识协议确保了leader变更和epoch递增的原子性。
+
 ## 解决方案概述
 
 我们实现了一个基于ZooKeeper的选举事务（Election TX）设计，确保leader变更和leaderEpoch递增是原子操作。该设计保证这两个操作要么一起成功，要么一起失败，从而消除了leader和epoch不同步的可能性。
@@ -25,6 +31,7 @@
 4. **ElectionTxnConfig**:
    - 控制特性开关和行为
    - 支持按主题启用/禁用，便于灰度发布
+   - 自动检测并在KRaft模式下禁用
 
 ### 关键改动
 
@@ -35,7 +42,7 @@
 ## 配置参数
 
 ```properties
-# 是否启用选举事务功能（默认：false）
+# 是否启用选举事务功能（默认：false）（在KRaft模式下会被忽略）
 controller.use.election.tx=true
 
 # 最大重试次数（默认：3）
@@ -66,4 +73,8 @@ controller.election.tx.enabled.topics=topic1,topic2
 
 ## 效果
 
-实施此方案后，将彻底解决僵尸leader问题，确保leader变更和epoch递增的原子性，消除生产者报告的NotLeaderOrFollowerException异常。 
+实施此方案后，将彻底解决僵尸leader问题，确保leader变更和epoch递增的原子性，消除生产者报告的NotLeaderOrFollowerException异常。
+
+## KRaft模式兼容性
+
+此修复在检测到KRaft模式时会自动禁用，并在日志中记录警告信息。KRaft模式已经通过其内部实现解决了leader和epoch一致性的问题。 

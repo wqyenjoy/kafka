@@ -46,8 +46,9 @@ class KafkaServer(
       name = Some("Kafka server"),
       zkClientConfig = zkClientConfig)
     
-    // Initialize ElectionTxnManager if the feature is enabled
+    // Initialize ElectionTxnManager if the feature is enabled and we're not in KRaft mode
     if (_electionTxnConfig.useElectionTx) {
+      // In KRaft mode, this will already be false due to the check in ElectionTxnConfig
       info(s"Initializing Election Transaction Manager with config: $_electionTxnConfig")
       val metrics = new ElectionTxnMetrics()
       val manager = new ElectionTxnManagerZk(zkClient, _electionTxnConfig.retryMax)
@@ -58,6 +59,16 @@ class KafkaServer(
       leaderEpochMonitor = Some(monitor)
       
       info("Election Transaction Manager initialized successfully")
+    } else {
+      // Check if this feature was explicitly enabled but we're in KRaft mode
+      val processRoles = config.getString("process.roles", "")
+      val featureExplicitlyEnabled = config.originals().containsKey(ElectionTxnConfig.UseElectionTxProp) && 
+                                     config.getBoolean(ElectionTxnConfig.UseElectionTxProp)
+      
+      if (featureExplicitlyEnabled && processRoles.nonEmpty) {
+        warn("Election Transaction feature was explicitly enabled but is being ignored because KRaft mode is active. " +
+             "This feature is only applicable in ZooKeeper mode.")
+      }
     }
     
     zkClient
