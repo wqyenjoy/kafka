@@ -28,8 +28,11 @@ class ElectionTxnConfig(config: KafkaConfig) extends Logging {
   
   /**
    * Whether to use the Election Transaction feature
+   * Only enabled if:
+   * 1. The user has enabled it explicitly via configuration
+   * 2. We're running in ZooKeeper mode (not KRaft)
    */
-  val useElectionTx: Boolean = config.getBoolean(ElectionTxnConfig.UseElectionTxProp)
+  val useElectionTx: Boolean = config.getBoolean(ElectionTxnConfig.UseElectionTxProp) && !isKRaftMode
   
   /**
    * Maximum number of retries for Election Transaction operations
@@ -56,9 +59,19 @@ class ElectionTxnConfig(config: KafkaConfig) extends Logging {
     useElectionTx && (enabledTopics.isEmpty || enabledTopics.contains(topic))
   }
   
+  /**
+   * Determine if we're running in KRaft mode
+   */
+  private def isKRaftMode: Boolean = {
+    // Check for process.roles which would indicate KRaft mode
+    val processRoles = config.getString("process.roles", "")
+    processRoles.nonEmpty
+  }
+  
   override def toString: String = {
     s"ElectionTxnConfig(useElectionTx=$useElectionTx, retryMax=$retryMax, " +
-      s"enabledTopics=${if (enabledTopics.isEmpty) "all" else enabledTopics.mkString(",")})"
+      s"enabledTopics=${if (enabledTopics.isEmpty) "all" else enabledTopics.mkString(",")}, " +
+      s"isKRaftMode=${isKRaftMode})"
   }
 }
 
@@ -81,7 +94,7 @@ object ElectionTxnConfig {
     
     KafkaConfig.configDef
       .define(UseElectionTxProp, Type.BOOLEAN, DefaultUseElectionTx, Importance.MEDIUM,
-        "Whether to use atomic election transactions for leader changes.")
+        "Whether to use atomic election transactions for leader changes in ZooKeeper mode (ignored in KRaft mode).")
       .define(ElectionTxRetryMaxProp, Type.INT, DefaultElectionTxRetryMax, Importance.MEDIUM,
         "Maximum number of retry attempts for election transactions.")
       .define(ElectionTxEnabledTopicsProp, Type.LIST, DefaultElectionTxEnabledTopics, Importance.MEDIUM,
