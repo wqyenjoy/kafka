@@ -17,98 +17,102 @@
 
 package kafka
 
+import java.util
 import java.util.Properties
-import joptsimple.OptionParser
-import kafka.server.{KafkaConfig, KafkaRaftServer, Server}
-import kafka.utils.Implicits._
-import kafka.utils.Logging
-import org.apache.kafka.common.utils.{Exit, Java, LoggingSignalHandler, OperatingSystem, Time, Utils}
-import org.apache.kafka.server.util.CommandLineUtils
 
+import kafka.metrics.KafkaMetricsReporter
+import kafka.server.{KafkaConfig, KafkaServer, Server}
+import kafka.utils._
+import org.apache.kafka.common.utils.{Exit, Java, LoggingSignalHandler, OperatingSystem, Time, Utils}
+import org.apache.kafka.server.config.ZooKeeperConfig
+import org.apache.kafka.server.util.{CommandDefaultOptions, CommandLineUtils}
+
+import scala.jdk.CollectionConverters._
+
+/**
+ * Starts a Kafka broker as a daemon.
+ */
 object Kafka extends Logging {
 
   def getPropsFromArgs(args: Array[String]): Properties = {
-    val optionParser = new OptionParser(false)
-    val overrideOpt = optionParser.accepts("override", "Optional property that should override values set in server.properties file")
-      .withRequiredArg()
-      .ofType(classOf[String])
-    // This is just to make the parameter show up in the help output, we are not actually using this due the
-    // fact that this class ignores the first parameter which is interpreted as positional and mandatory
-    // but would not be mandatory if --version is specified
-    // This is a bit of an ugly crutch till we get a chance to rework the entire command line parsing
-    optionParser.accepts("version", "Print version information and exit.")
-
-    if (args.isEmpty || args.contains("--help")) {
-      CommandLineUtils.printUsageAndExit(optionParser,
-        "USAGE: java [options] %s server.properties [--override property=value]*".format(this.getClass.getCanonicalName.split('$').head))
+    val optionParser = new CommandDefaultOptions(args)
+    if (args.length == 0 || optionParser.options.has(optionParser.helpOpt)) {
+      CommandLineUtils.printUsageAndDie(optionParser.parser, "USAGE: java [options] %s server.properties [--override property=value]*".format(classOf[KafkaServer].getSimpleName))
     }
 
-    if (args.contains("--version")) {
-      CommandLineUtils.printVersionAndExit()
+    if (optionParser.options.nonOptionArguments().size < 1) {
+      CommandLineUtils.printUsageAndDie(optionParser.parser, "USAGE: java [options] %s server.properties [--override property=value]*".format(classOf[KafkaServer].getSimpleName))
     }
+    // parse first argument as a path to properties file
+    val serverProps = Utils.loadProps(optionParser.options.nonOptionArguments().get(0))
 
-    val props = Utils.loadProps(args(0))
+    // parse overwrites to the properties file
+    if (optionParser.options.has(optionParser.overrideOpt) && !optionParser.options.valuesOf(optionParser.overrideOpt).isEmpty) {
+      val overrides = optionParser.options.valuesOf(optionParser.overrideOpt).asScala.map(CommandLineUtils.parseKeyValue)
 
-    if (args.length > 1) {
-      val options = optionParser.parse(args.slice(1, args.length): _*)
+      CommandLineUtils.checkRequiredArgs(optionParser.parser, overrides, CommandLineUtils.KeyValueSeparator)
 
-      if (options.nonOptionArguments().size() > 0) {
-        CommandLineUtils.printUsageAndExit(optionParser, "Found non argument parameters: " + options.nonOptionArguments().toArray.mkString(","))
-      }
-
-      props ++= CommandLineUtils.parseKeyValueArgs(options.valuesOf(overrideOpt))
+      val overrideProps = new Properties()
+      overrides.foreach { case (k, v) => overrideProps.put(k, v) }
+      serverProps.putAll(overrideProps)
     }
-    props
-  }
-
-  private def buildServer(props: Properties): Server = {
-    val config = KafkaConfig.fromProps(props, doLog = false)
-    new KafkaRaftServer(
-      config,
-      Time.SYSTEM,
-    )
+    serverProps
   }
 
   def main(args: Array[String]): Unit = {
+    // Register election transaction config
+    kafka.server.KafkaServer.initializeElectionTxnConfig()
+    
     try {
       val serverProps = getPropsFromArgs(args)
-      val server = buildServer(serverProps)
+      val statusFilePath = serverProps.getProperty(KafkaConfig.KafkaPidFileProp)
+      val kafkaServerClass = serverProps.getProperty(KafkaConfig.KafkaServerClassProp, KafkaConfig.DefaultKafkaServerClass)
 
-      try {
-        if (!OperatingSystem.IS_WINDOWS && !Java.isIbmJdk)
-          new LoggingSignalHandler().register()
-      } catch {
-        case e: ReflectiveOperationException =>
-          warn("Failed to register optional signal handler that logs a message when the process is terminated " +
-            s"by a signal. Reason for registration failure is: $e", e)
-      }
+      val statusFile = Option(statusFilePath).map(new StatusFile(_, "pid"))
 
-      // attach shutdown handler to catch terminating signals as well as normal termination
-      Exit.addShutdownHook("kafka-shutdown-hook", () => {
-        try server.shutdown()
-        catch {
-          case _: Throwable =>
-            fatal("Halting Kafka.")
-            // Calling exit() can lead to deadlock as exit() can be called multiple times. Force exit.
-            Exit.halt(1)
+      // load server services classes
+      val server = Class.forName(kafkaServerClass).getDeclaredConstructor().newInstance().asInstanceOf[Server]
+
+      val exitCode = try {
+        try {
+          if (statusFile.isDefined)
+            statusFile.foreach(_.write(kafka.utils.JVMInfoUtils.jvmIdString()))
+
+          // attach shutdown handler to catch terminating signals as well as normal termination
+          Exit.addShutdownHook("kafka-shutdown-hook", () => server.shutdown())
+          LoggingSignalHandler.register(signals)
+
+          server.startup()
+
+          server.awaitShutdown()
+          0
         }
-      })
-
-      try server.startup()
-      catch {
-        case e: Throwable =>
-          // KafkaBroker.startup() calls shutdown() in case of exceptions, so we invoke `exit` to set the status code
-          fatal("Exiting Kafka due to fatal exception during startup.", e)
-          Exit.exit(1)
+        catch {
+          case e: Throwable =>
+            fatal("Exiting Kafka due to fatal exception", e)
+            1
+        }
       }
-
-      server.awaitShutdown()
+      finally {
+        Exit.deleteHook("kafka-shutdown-hook")
+        if (statusFile.isDefined)
+          statusFile.foreach(_.delete())
+      }
+      Exit.exit(exitCode)
     }
     catch {
       case e: Throwable =>
-        fatal("Exiting Kafka due to fatal exception", e)
+        fatal("Exiting Kafka due to fatal exception during startup", e)
         Exit.exit(1)
     }
-    Exit.exit(0)
+  }
+
+  private def signals: Array[Signal] = {
+    val handlers = new Array[Signal](3)
+    handlers(0) = new Signal("INT")
+    // SIGTERM is used for container orchestration and termination
+    handlers(1) = new Signal("TERM")
+    handlers(2) = OperatingSystem.get().getTerminationSignal
+    handlers
   }
 }
